@@ -1,7 +1,8 @@
-"""Intelligent Streamlit dashboard for renewable energy projects."""
+"""Streamlit app that transforms interviews into tabular data and analyzes them."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -10,20 +11,44 @@ import requests
 import streamlit as st
 
 
-APP_TITLE = "Renewable Energy Intelligence Hub"
+APP_TITLE = "Interview Intelligence Studio"
 MODEL_NAME = "llama-3.3-70b-versatile"
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 BASE_DIR = Path(__file__).resolve().parent
-DATA_FILE = BASE_DIR / "energia_renovable.csv"
-PROMPT_FILE = BASE_DIR / "system_prompt.txt"
-PRIMARY_COLOR = "#0C4D78"
-SECONDARY_COLOR = "#00A896"
-ACCENT_COLOR = "#E76F51"
+ANALYSIS_PROMPT_FILE = BASE_DIR / "system_prompt.txt"
+EXTRACTION_PROMPT_FILE = BASE_DIR / "extraction_prompt.txt"
+PRIMARY_COLOR = "#0B4F6C"
+SECONDARY_COLOR = "#01BAEF"
+ACCENT_COLOR = "#20BF55"
+
+EXPECTED_COLUMNS = [
+    "interview_id",
+    "respondent_id",
+    "respondent_profile",
+    "location",
+    "topic",
+    "pain_point",
+    "current_solution",
+    "desired_outcome",
+    "sentiment",
+    "urgency_score",
+    "budget_score",
+    "adoption_readiness_score",
+    "confidence_score",
+    "quote",
+]
+
+NUMERIC_COLUMNS = [
+    "urgency_score",
+    "budget_score",
+    "adoption_readiness_score",
+    "confidence_score",
+]
 
 
 st.set_page_config(
     page_title=APP_TITLE,
-    page_icon="⚡",
+    page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -33,21 +58,21 @@ st.markdown(
     <style>
     .stApp {
         background:
-            radial-gradient(circle at top left, rgba(12, 77, 120, 0.14), transparent 30%),
-            radial-gradient(circle at top right, rgba(0, 168, 150, 0.12), transparent 28%),
-            linear-gradient(180deg, #f7fafc 0%, #edf4f7 100%);
+            radial-gradient(circle at top left, rgba(11, 79, 108, 0.12), transparent 28%),
+            radial-gradient(circle at top right, rgba(1, 186, 239, 0.10), transparent 26%),
+            linear-gradient(180deg, #f6fbfd 0%, #eef5f8 100%);
     }
     .hero-box {
-        background: rgba(255, 255, 255, 0.9);
-        border: 1px solid rgba(12, 77, 120, 0.10);
+        background: rgba(255, 255, 255, 0.92);
+        border: 1px solid rgba(11, 79, 108, 0.10);
         border-radius: 20px;
         padding: 1.2rem 1.4rem;
         margin-bottom: 1rem;
-        box-shadow: 0 14px 34px rgba(12, 77, 120, 0.08);
+        box-shadow: 0 12px 32px rgba(11, 79, 108, 0.08);
     }
     .insight-box {
-        background: linear-gradient(135deg, rgba(12, 77, 120, 0.08), rgba(0, 168, 150, 0.07));
-        border: 1px solid rgba(12, 77, 120, 0.12);
+        background: linear-gradient(135deg, rgba(11, 79, 108, 0.07), rgba(32, 191, 85, 0.06));
+        border: 1px solid rgba(11, 79, 108, 0.12);
         border-radius: 16px;
         padding: 1rem 1.1rem;
         margin: 0.5rem 0 1rem 0;
@@ -59,107 +84,93 @@ st.markdown(
 
 
 @st.cache_data
-def load_data(uploaded_file=None) -> pd.DataFrame:
-    source = uploaded_file if uploaded_file is not None else DATA_FILE
-    return pd.read_csv(source)
-
-
-@st.cache_data
-def load_system_prompt() -> str:
-    return PROMPT_FILE.read_text(encoding="utf-8").strip()
+def load_prompt(prompt_path: str) -> str:
+    return Path(prompt_path).read_text(encoding="utf-8").strip()
 
 
 def initialize_session() -> None:
     if "messages" not in st.session_state:
         st.session_state.messages = []
-
-
-def clean_data(df: pd.DataFrame) -> pd.DataFrame:
-    data = df.copy()
-    data.columns = data.columns.str.strip()
-    data["Fecha_Entrada_Operacion"] = pd.to_datetime(
-        data["Fecha_Entrada_Operacion"], errors="coerce"
-    )
-    data["Conectado_SIN"] = (
-        data["Conectado_SIN"].astype(str).str.lower().map({"true": True, "false": False})
-    )
-    for column in [
-        "Capacidad_Instalada_MW",
-        "Generacion_Diaria_MWh",
-        "Eficiencia_Planta_Pct",
-        "Inversion_Inicial_MUSD",
-    ]:
-        data[column] = pd.to_numeric(data[column], errors="coerce")
-    return data
-
-
-def format_number(value: float, decimals: int = 1) -> str:
-    return f"{value:,.{decimals}f}"
+    if "structured_records" not in st.session_state:
+        st.session_state.structured_records = []
+    if "analysis_summary" not in st.session_state:
+        st.session_state.analysis_summary = ""
 
 
 def add_insight(message: str) -> None:
     st.markdown(f'<div class="insight-box">{message}</div>', unsafe_allow_html=True)
 
 
-def build_sidebar(base_df: pd.DataFrame) -> dict:
+def format_number(value: float, decimals: int = 1) -> str:
+    return f"{value:,.{decimals}f}"
+
+
+def build_sidebar(has_data: bool, df: pd.DataFrame | None = None) -> dict:
     with st.sidebar:
-        st.title("Dashboard Controls")
+        st.title("AI Controls")
         api_key = st.text_input("Groq API Key", type="password")
-        uploaded_file = st.file_uploader("Optional CSV override", type=["csv"])
-        language = st.selectbox("AI response language", ["Auto", "Spanish", "English"], index=0)
-        temperature = st.slider("Temperature", min_value=0.0, max_value=1.5, value=0.3, step=0.1)
-        max_tokens = st.slider("Max tokens", min_value=256, max_value=2048, value=700, step=128)
+        language = st.selectbox("Response language", ["Auto", "Spanish", "English"], index=0)
+        extraction_temperature = st.slider(
+            "Extraction temperature",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.1,
+            step=0.1,
+        )
+        analysis_temperature = st.slider(
+            "Analysis temperature",
+            min_value=0.0,
+            max_value=1.5,
+            value=0.3,
+            step=0.1,
+        )
+        max_tokens = st.slider("Max tokens", min_value=256, max_value=2048, value=900, step=128)
+        uploaded_file = st.file_uploader("Optional interview text file", type=["txt", "md"])
 
-        technologies = sorted(base_df["Tecnologia"].dropna().unique().tolist())
-        operators = sorted(base_df["Operador"].dropna().unique().tolist())
-        states = sorted(base_df["Estado_Actual"].dropna().unique().tolist())
+        filters = {
+            "topics": [],
+            "sentiments": [],
+            "profiles": [],
+            "locations": [],
+        }
 
-        st.markdown("---")
-        st.markdown("### Filters")
-        technology_sel = st.multiselect("Technology", technologies, default=technologies)
-        operator_sel = st.multiselect("Operator", operators, default=operators)
-        state_sel = st.multiselect("Project state", states, default=states)
-        connected_sel = st.multiselect("Connected to SIN", [True, False], default=[True, False])
-
-        min_date = base_df["Fecha_Entrada_Operacion"].min()
-        max_date = base_df["Fecha_Entrada_Operacion"].max()
-        date_range = None
-        if pd.notna(min_date) and pd.notna(max_date):
-            date_range = st.date_input(
-                "Operation start date range",
-                value=(min_date.date(), max_date.date()),
-                min_value=min_date.date(),
-                max_value=max_date.date(),
+        if has_data and df is not None and not df.empty:
+            st.markdown("---")
+            st.markdown("### EDA Filters")
+            filters["topics"] = st.multiselect(
+                "Topic",
+                sorted(df["topic"].dropna().astype(str).unique().tolist()),
+                default=sorted(df["topic"].dropna().astype(str).unique().tolist()),
+            )
+            filters["sentiments"] = st.multiselect(
+                "Sentiment",
+                sorted(df["sentiment"].dropna().astype(str).unique().tolist()),
+                default=sorted(df["sentiment"].dropna().astype(str).unique().tolist()),
+            )
+            filters["profiles"] = st.multiselect(
+                "Respondent profile",
+                sorted(df["respondent_profile"].dropna().astype(str).unique().tolist()),
+                default=sorted(df["respondent_profile"].dropna().astype(str).unique().tolist()),
+            )
+            filters["locations"] = st.multiselect(
+                "Location",
+                sorted(df["location"].dropna().astype(str).unique().tolist()),
+                default=sorted(df["location"].dropna().astype(str).unique().tolist()),
             )
 
-        if st.button("Clear chat"):
+        if st.button("Clear AI chat"):
             st.session_state.messages = []
             st.rerun()
 
     return {
         "api_key": api_key,
-        "uploaded_file": uploaded_file,
         "language": language,
-        "temperature": temperature,
+        "extraction_temperature": extraction_temperature,
+        "analysis_temperature": analysis_temperature,
         "max_tokens": max_tokens,
-        "technology_sel": technology_sel,
-        "operator_sel": operator_sel,
-        "state_sel": state_sel,
-        "connected_sel": connected_sel,
-        "date_range": date_range,
+        "uploaded_file": uploaded_file,
+        "filters": filters,
     }
-
-
-def filter_data(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
-    data = df.copy()
-    data = data[data["Tecnologia"].isin(filters["technology_sel"])]
-    data = data[data["Operador"].isin(filters["operator_sel"])]
-    data = data[data["Estado_Actual"].isin(filters["state_sel"])]
-    data = data[data["Conectado_SIN"].isin(filters["connected_sel"])]
-    if filters["date_range"] and len(filters["date_range"]) == 2:
-        start_date, end_date = filters["date_range"]
-        data = data[data["Fecha_Entrada_Operacion"].dt.date.between(start_date, end_date)]
-    return data
 
 
 def language_instruction(language: str) -> str:
@@ -170,81 +181,10 @@ def language_instruction(language: str) -> str:
     return "Answer in the same language used by the user."
 
 
-def build_dataset_context(df: pd.DataFrame) -> str:
-    project_count = len(df)
-    total_capacity = df["Capacidad_Instalada_MW"].sum()
-    total_generation = df["Generacion_Diaria_MWh"].sum()
-    avg_efficiency = df["Eficiencia_Planta_Pct"].mean()
-    total_investment = df["Inversion_Inicial_MUSD"].sum()
-    connected_share = df["Conectado_SIN"].mean() * 100 if project_count else 0
-    top_tech = df["Tecnologia"].value_counts().head(3).to_dict()
-    top_states = df["Estado_Actual"].value_counts().to_dict()
-    top_operators = df["Operador"].value_counts().head(5).to_dict()
-    numeric_summary = (
-        df[[
-            "Capacidad_Instalada_MW",
-            "Generacion_Diaria_MWh",
-            "Eficiencia_Planta_Pct",
-            "Inversion_Inicial_MUSD",
-        ]]
-        .describe()
-        .round(2)
-        .to_dict()
-    )
-    top_projects = (
-        df.nlargest(5, "Generacion_Diaria_MWh")[[
-            "ID_Proyecto",
-            "Tecnologia",
-            "Operador",
-            "Generacion_Diaria_MWh",
-            "Capacidad_Instalada_MW",
-            "Estado_Actual",
-        ]]
-        .to_dict(orient="records")
-    )
-
-    min_date = df["Fecha_Entrada_Operacion"].min()
-    max_date = df["Fecha_Entrada_Operacion"].max()
-    date_range_text = "unknown"
-    if pd.notna(min_date) and pd.notna(max_date):
-        date_range_text = f"{min_date.date()} to {max_date.date()}"
-
-    return "\n".join(
-        [
-            "Dataset name: energia_renovable.csv",
-            f"Filtered project count: {project_count}",
-            f"Date range: {date_range_text}",
-            f"Total installed capacity MW: {total_capacity:.2f}",
-            f"Total daily generation MWh: {total_generation:.2f}",
-            f"Average efficiency pct: {avg_efficiency:.2f}",
-            f"Total initial investment MUSD: {total_investment:.2f}",
-            f"Connected to SIN share pct: {connected_share:.2f}",
-            f"Top technologies: {top_tech}",
-            f"Project states: {top_states}",
-            f"Top operators: {top_operators}",
-            f"Numeric summary: {numeric_summary}",
-            f"Top generation projects: {top_projects}",
-        ]
-    )
-
-
-def build_messages(user_prompt: str, selected_language: str, dataset_context: str) -> list[dict[str, str]]:
-    system_prompt = load_system_prompt()
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                f"{system_prompt}\n\n"
-                f"{language_instruction(selected_language)}\n\n"
-                "Use the following dataset context as the primary source for data-specific answers. "
-                "Do not invent values that are not supported by this context.\n\n"
-                f"{dataset_context}"
-            ),
-        }
-    ]
-    messages.extend(st.session_state.messages)
-    messages.append({"role": "user", "content": user_prompt})
-    return messages
+def decode_uploaded_text(uploaded_file) -> str:
+    if uploaded_file is None:
+        return ""
+    return uploaded_file.getvalue().decode("utf-8", errors="ignore")
 
 
 def request_groq_completion(
@@ -272,14 +212,143 @@ def request_groq_completion(
     return data["choices"][0]["message"]["content"].strip()
 
 
+def parse_json_payload(raw_text: str) -> list[dict]:
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[1]
+        if cleaned.endswith("```"):
+            cleaned = cleaned.rsplit("```", 1)[0]
+        cleaned = cleaned.strip()
+
+    opening_positions = [index for index in [cleaned.find("{"), cleaned.find("[")] if index != -1]
+    first_brace = min(opening_positions, default=-1)
+    last_brace = max(cleaned.rfind("}"), cleaned.rfind("]"))
+    if first_brace != -1 and last_brace != -1:
+        cleaned = cleaned[first_brace : last_brace + 1]
+
+    payload = json.loads(cleaned)
+    if isinstance(payload, dict):
+        records = payload.get("records", [])
+    elif isinstance(payload, list):
+        records = payload
+    else:
+        records = []
+
+    if not isinstance(records, list):
+        raise ValueError("The model response does not contain a valid records list.")
+    return records
+
+
+def normalize_records(records: list[dict]) -> pd.DataFrame:
+    rows = []
+    for record in records:
+        row = {column: record.get(column) for column in EXPECTED_COLUMNS}
+        rows.append(row)
+
+    df = pd.DataFrame(rows, columns=EXPECTED_COLUMNS)
+    if df.empty:
+        return df
+
+    for column in NUMERIC_COLUMNS:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    text_columns = [
+        "interview_id",
+        "respondent_id",
+        "respondent_profile",
+        "location",
+        "topic",
+        "pain_point",
+        "current_solution",
+        "desired_outcome",
+        "sentiment",
+        "quote",
+    ]
+    for column in text_columns:
+        df[column] = df[column].fillna("Unknown").astype(str).str.strip()
+
+    return df
+
+
+def build_extraction_messages(transcript_text: str, selected_language: str) -> list[dict[str, str]]:
+    extraction_prompt = load_prompt(str(EXTRACTION_PROMPT_FILE))
+    return [
+        {
+            "role": "system",
+            "content": f"{extraction_prompt}\n\n{language_instruction(selected_language)}",
+        },
+        {"role": "user", "content": transcript_text},
+    ]
+
+
+def build_dataset_context(df: pd.DataFrame) -> str:
+    topic_counts = df["topic"].value_counts().head(8).to_dict()
+    sentiment_counts = df["sentiment"].value_counts().to_dict()
+    profile_counts = df["respondent_profile"].value_counts().head(8).to_dict()
+    location_counts = df["location"].value_counts().head(8).to_dict()
+    pain_points = df["pain_point"].value_counts().head(10).to_dict()
+    desired_outcomes = df["desired_outcome"].value_counts().head(10).to_dict()
+    numeric_summary = df[NUMERIC_COLUMNS].describe().round(2).to_dict()
+    sample_records = df.head(12).to_dict(orient="records")
+
+    return "\n".join(
+        [
+            "Dataset origin: AI-structured interview transcript",
+            f"Structured rows: {len(df)}",
+            f"Unique interviews: {df['interview_id'].nunique()}",
+            f"Unique respondents: {df['respondent_id'].nunique()}",
+            f"Topics: {topic_counts}",
+            f"Sentiments: {sentiment_counts}",
+            f"Profiles: {profile_counts}",
+            f"Locations: {location_counts}",
+            f"Pain points: {pain_points}",
+            f"Desired outcomes: {desired_outcomes}",
+            f"Numeric summary: {numeric_summary}",
+            f"Sample structured records: {sample_records}",
+        ]
+    )
+
+
+def build_analysis_messages(user_prompt: str, selected_language: str, dataset_context: str) -> list[dict[str, str]]:
+    system_prompt = load_prompt(str(ANALYSIS_PROMPT_FILE))
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                f"{system_prompt}\n\n"
+                f"{language_instruction(selected_language)}\n\n"
+                "Use the following structured interview dataset context as the primary source for your answer. "
+                "Do not invent counts or scores beyond the supplied context.\n\n"
+                f"{dataset_context}"
+            ),
+        }
+    ]
+    messages.extend(st.session_state.messages)
+    messages.append({"role": "user", "content": user_prompt})
+    return messages
+
+
+def filter_structured_data(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
+    filtered = df.copy()
+    if filters["topics"]:
+        filtered = filtered[filtered["topic"].isin(filters["topics"])]
+    if filters["sentiments"]:
+        filtered = filtered[filtered["sentiment"].isin(filters["sentiments"])]
+    if filters["profiles"]:
+        filtered = filtered[filtered["respondent_profile"].isin(filters["profiles"])]
+    if filters["locations"]:
+        filtered = filtered[filtered["location"].isin(filters["locations"])]
+    return filtered
+
+
 def render_header() -> None:
     st.markdown(
         """
         <div class="hero-box">
-            <h1 style="margin-bottom:0.2rem;">Renewable Energy Intelligence Hub</h1>
+            <h1 style="margin-bottom:0.2rem;">Interview Intelligence Studio</h1>
             <p style="margin:0; color:#43596b; font-size:1.05rem;">
-                Explore the renewable energy dataset with filters, operational metrics, investment views,
-                and an Llama 3.3 70B copilot that explains the filtered data when you chat with it.
+                Paste an interview transcript, transform it into structured tabular data with Llama 3.3 70B,
+                and run a strong Streamlit EDA with AI explanations on top of the extracted dataset.
             </p>
         </div>
         """,
@@ -287,180 +356,211 @@ def render_header() -> None:
     )
 
 
+def render_ingestion(settings: dict) -> pd.DataFrame | None:
+    st.subheader("1. Interview to table")
+    st.caption("Paste one or more interviews. The model will convert the text into structured rows for analysis.")
+
+    uploaded_text = decode_uploaded_text(settings["uploaded_file"])
+    transcript_text = st.text_area(
+        "Interview transcript",
+        value=uploaded_text,
+        height=260,
+        placeholder="Paste the interview transcript here. The AI will extract one structured row per relevant insight.",
+    )
+
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        transform_clicked = st.button("Transform into table", type="primary")
+    with col2:
+        if transcript_text.strip():
+            st.caption(f"Transcript length: {len(transcript_text.split())} words")
+
+    if not transform_clicked:
+        if st.session_state.structured_records:
+            return normalize_records(st.session_state.structured_records)
+        return None
+
+    if not settings["api_key"]:
+        st.warning("Enter your Groq API key in the sidebar before transforming the interview.")
+        return None
+
+    if not transcript_text.strip():
+        st.warning("Paste interview text before running the transformation.")
+        return None
+
+    with st.spinner("Transforming transcript into structured rows..."):
+        try:
+            raw_response = request_groq_completion(
+                api_key=settings["api_key"],
+                messages=build_extraction_messages(transcript_text, settings["language"]),
+                temperature=settings["extraction_temperature"],
+                max_tokens=settings["max_tokens"],
+            )
+            records = parse_json_payload(raw_response)
+            structured_df = normalize_records(records)
+            if structured_df.empty:
+                st.error("The model returned no structured rows. Try a clearer transcript or a smaller chunk of text.")
+                return None
+            st.session_state.structured_records = structured_df.to_dict(orient="records")
+            st.session_state.messages = []
+            st.session_state.analysis_summary = ""
+            st.success(f"Structured dataset created with {len(structured_df)} rows.")
+            return structured_df
+        except requests.HTTPError as exc:
+            st.error(f"Groq API error: {exc.response.status_code} - {exc.response.text}")
+        except requests.RequestException as exc:
+            st.error(f"Request error: {exc}")
+        except (json.JSONDecodeError, ValueError) as exc:
+            st.error(f"The AI response could not be parsed into structured JSON: {exc}")
+
+    return None
+
+
 def render_kpis(df: pd.DataFrame) -> None:
     cols = st.columns(5)
-    cols[0].metric("Projects", str(len(df)))
-    cols[1].metric("Installed capacity", f"{format_number(df['Capacidad_Instalada_MW'].sum())} MW")
-    cols[2].metric("Daily generation", f"{format_number(df['Generacion_Diaria_MWh'].sum())} MWh")
-    cols[3].metric("Avg. efficiency", f"{format_number(df['Eficiencia_Planta_Pct'].mean())} %")
-    cols[4].metric("Initial investment", f"{format_number(df['Inversion_Inicial_MUSD'].sum())} MUSD")
+    cols[0].metric("Structured rows", str(len(df)))
+    cols[1].metric("Interviews", str(df["interview_id"].nunique()))
+    cols[2].metric("Respondents", str(df["respondent_id"].nunique()))
+    cols[3].metric("Avg. urgency", format_number(df["urgency_score"].mean()))
+    cols[4].metric("Avg. adoption", format_number(df["adoption_readiness_score"].mean()))
 
 
 def render_overview(df: pd.DataFrame) -> None:
-    st.subheader("Portfolio Overview")
+    st.subheader("2. EDA Overview")
     render_kpis(df)
 
-    connected_share = df["Conectado_SIN"].mean() * 100 if len(df) else 0
-    lead_technology = df["Tecnologia"].value_counts().idxmax()
-    lead_state = df["Estado_Actual"].value_counts().idxmax()
+    top_topic = df["topic"].value_counts().idxmax()
+    top_sentiment = df["sentiment"].value_counts().idxmax()
     add_insight(
-        f"The filtered portfolio contains <b>{len(df)}</b> projects. The dominant technology is <b>{lead_technology}</b>, "
-        f"the most common state is <b>{lead_state}</b>, and <b>{connected_share:.1f}%</b> of projects are connected to SIN."
+        f"The dataset currently contains <b>{len(df)}</b> structured insights. The most frequent topic is <b>{top_topic}</b> and the dominant sentiment is <b>{top_sentiment}</b>."
     )
 
     left, right = st.columns(2)
-    tech_counts = df["Tecnologia"].value_counts().reset_index()
-    tech_counts.columns = ["Technology", "Projects"]
-    state_counts = df["Estado_Actual"].value_counts().reset_index()
-    state_counts.columns = ["State", "Projects"]
+    topic_counts = df["topic"].value_counts().reset_index()
+    topic_counts.columns = ["Topic", "Count"]
+    sentiment_counts = df["sentiment"].value_counts().reset_index()
+    sentiment_counts.columns = ["Sentiment", "Count"]
 
     with left:
         fig = px.bar(
-            tech_counts,
-            x="Projects",
-            y="Technology",
+            topic_counts,
+            x="Count",
+            y="Topic",
             orientation="h",
-            title="Project mix by technology",
-            text="Projects",
-            color="Projects",
-            color_continuous_scale="Tealgrn",
+            title="Topic frequency",
+            text="Count",
+            color="Count",
+            color_continuous_scale="Blues",
         )
-        fig.update_layout(showlegend=False, xaxis_title="Projects", yaxis_title="")
+        fig.update_layout(showlegend=False, xaxis_title="Insights", yaxis_title="")
         st.plotly_chart(fig, use_container_width=True)
 
     with right:
         fig = px.pie(
-            state_counts,
-            values="Projects",
-            names="State",
+            sentiment_counts,
+            values="Count",
+            names="Sentiment",
             hole=0.45,
-            title="Project state share",
+            title="Sentiment mix",
             color_discrete_sequence=px.colors.qualitative.Set2,
         )
         fig.update_traces(textposition="inside", textinfo="percent+label")
         st.plotly_chart(fig, use_container_width=True)
 
 
-def render_operations(df: pd.DataFrame) -> None:
-    st.subheader("Operations and Performance")
+def render_needs_and_profiles(df: pd.DataFrame) -> None:
+    st.subheader("3. Needs, pains, and profiles")
     left, right = st.columns(2)
 
     with left:
-        monthly = (
-            df.assign(Month=df["Fecha_Entrada_Operacion"].dt.to_period("M").dt.to_timestamp())
-            .groupby("Month", as_index=False)
-            .agg(
-                Projects=("ID_Proyecto", "count"),
-                Capacity_MW=("Capacidad_Instalada_MW", "sum"),
-                Generation_MWh=("Generacion_Diaria_MWh", "sum"),
-            )
+        pain_counts = df["pain_point"].value_counts().head(10).reset_index()
+        pain_counts.columns = ["Pain point", "Count"]
+        fig = px.bar(
+            pain_counts,
+            x="Count",
+            y="Pain point",
+            orientation="h",
+            title="Top pain points",
+            text="Count",
+            color="Count",
+            color_continuous_scale="Reds",
         )
-        fig = px.line(
-            monthly,
-            x="Month",
-            y=["Projects", "Capacity_MW", "Generation_MWh"],
-            markers=True,
-            title="Monthly evolution of projects, capacity and generation",
-            color_discrete_sequence=[PRIMARY_COLOR, SECONDARY_COLOR, ACCENT_COLOR],
+        fig.update_layout(showlegend=False, xaxis_title="Mentions", yaxis_title="")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with right:
+        profile_counts = df["respondent_profile"].value_counts().head(10).reset_index()
+        profile_counts.columns = ["Profile", "Count"]
+        fig = px.bar(
+            profile_counts,
+            x="Profile",
+            y="Count",
+            title="Respondent profile distribution",
+            color="Count",
+            color_continuous_scale="Tealgrn",
         )
-        fig.update_layout(yaxis_title="Monthly total", legend_title_text="Metric")
+        fig.update_layout(xaxis_title="Profile", yaxis_title="Insights")
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def render_scores(df: pd.DataFrame) -> None:
+    st.subheader("4. Scoring analysis")
+    left, right = st.columns(2)
+
+    with left:
+        topic_scores = (
+            df.groupby("topic", as_index=False)[["urgency_score", "adoption_readiness_score"]]
+            .mean()
+            .sort_values("urgency_score", ascending=False)
+        )
+        fig = px.bar(
+            topic_scores,
+            x="topic",
+            y=["urgency_score", "adoption_readiness_score"],
+            barmode="group",
+            title="Average urgency vs adoption readiness by topic",
+            color_discrete_sequence=[PRIMARY_COLOR, ACCENT_COLOR],
+        )
+        fig.update_layout(xaxis_title="Topic", yaxis_title="Average score")
         st.plotly_chart(fig, use_container_width=True)
 
     with right:
         fig = px.scatter(
             df,
-            x="Capacidad_Instalada_MW",
-            y="Generacion_Diaria_MWh",
-            color="Tecnologia",
-            size="Inversion_Inicial_MUSD",
-            hover_data=["ID_Proyecto", "Operador", "Estado_Actual"],
-            title="Capacity vs daily generation",
-            color_discrete_sequence=px.colors.qualitative.Set2,
+            x="budget_score",
+            y="urgency_score",
+            color="sentiment",
+            size="confidence_score",
+            hover_data=["topic", "pain_point", "desired_outcome"],
+            title="Budget vs urgency",
+            color_discrete_sequence=px.colors.qualitative.Set1,
         )
-        fig.update_layout(
-            xaxis_title="Installed capacity (MW)",
-            yaxis_title="Daily generation (MWh)",
-            legend_title_text="Technology",
-        )
+        fig.update_layout(xaxis_title="Budget score", yaxis_title="Urgency score")
         st.plotly_chart(fig, use_container_width=True)
-
-
-def render_investment(df: pd.DataFrame) -> None:
-    st.subheader("Investment and Efficiency")
-    left, right = st.columns(2)
-
-    with left:
-        investment_by_operator = (
-            df.groupby("Operador", as_index=False)["Inversion_Inicial_MUSD"]
-            .sum()
-            .sort_values("Inversion_Inicial_MUSD", ascending=False)
-        )
-        fig = px.bar(
-            investment_by_operator,
-            x="Operador",
-            y="Inversion_Inicial_MUSD",
-            title="Initial investment by operator",
-            color="Inversion_Inicial_MUSD",
-            color_continuous_scale="Blues",
-        )
-        fig.update_layout(xaxis_title="Operator", yaxis_title="Investment (MUSD)")
-        st.plotly_chart(fig, use_container_width=True)
-
-    with right:
-        efficiency_by_tech = (
-            df.groupby("Tecnologia", as_index=False)["Eficiencia_Planta_Pct"]
-            .mean()
-            .sort_values("Eficiencia_Planta_Pct", ascending=False)
-        )
-        fig = px.bar(
-            efficiency_by_tech,
-            x="Eficiencia_Planta_Pct",
-            y="Tecnologia",
-            orientation="h",
-            title="Average efficiency by technology",
-            text="Eficiencia_Planta_Pct",
-            color="Eficiencia_Planta_Pct",
-            color_continuous_scale="Emrld",
-        )
-        fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
-        fig.update_layout(xaxis_title="Efficiency (%)", yaxis_title="")
-        st.plotly_chart(fig, use_container_width=True)
-
-
-def render_data_table(df: pd.DataFrame) -> None:
-    st.subheader("Filtered dataset")
-    st.dataframe(df, use_container_width=True)
-    st.download_button(
-        "Download filtered CSV",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name="renewable_energy_filtered.csv",
-        mime="text/csv",
-    )
 
 
 def render_ai_summary(settings: dict, dataset_context: str) -> None:
-    st.subheader("AI executive interpretation")
-    st.caption("Generate a concise interpretation of the currently filtered data using Llama 3.3 70B.")
+    st.subheader("5. AI summary")
+    st.caption("Generate an executive interpretation of the transformed interview dataset.")
 
     if not settings["api_key"]:
         st.info("Enter your Groq API key in the sidebar to generate AI interpretations.")
         return
 
-    if st.button("Generate AI interpretation"):
+    if st.button("Generate AI summary"):
         prompt = (
-            "Explain the filtered renewable energy dataset as an executive summary. "
-            "Highlight the portfolio size, dominant technologies, operational readiness, investment profile, "
-            "performance signals, and one or two risks or caveats from the data."
+            "Summarize the structured interview dataset. Explain the dominant themes, pain points, sentiment patterns, "
+            "respondent segments, urgency profile, willingness-to-pay signals, and what actions a team should take next."
         )
-        with st.spinner("Generating interpretation..."):
+        with st.spinner("Generating AI summary..."):
             try:
                 summary = request_groq_completion(
                     api_key=settings["api_key"],
-                    messages=build_messages(prompt, settings["language"], dataset_context),
-                    temperature=settings["temperature"],
+                    messages=build_analysis_messages(prompt, settings["language"], dataset_context),
+                    temperature=settings["analysis_temperature"],
                     max_tokens=settings["max_tokens"],
                 )
-                add_insight(summary)
+                st.session_state.analysis_summary = summary
             except requests.HTTPError as exc:
                 st.error(f"Groq API error: {exc.response.status_code} - {exc.response.text}")
             except requests.RequestException as exc:
@@ -468,22 +568,24 @@ def render_ai_summary(settings: dict, dataset_context: str) -> None:
             except (KeyError, IndexError, TypeError, ValueError) as exc:
                 st.error(f"Unexpected response format: {exc}")
 
+    if st.session_state.analysis_summary:
+        add_insight(st.session_state.analysis_summary)
 
-def render_chat(settings: dict, dataset_context: str) -> None:
-    st.subheader("Ask the dataset")
-    st.caption("Chat with Llama 3.3 70B about the filtered data currently shown in the dashboard.")
+
+def render_ai_chat(settings: dict, dataset_context: str) -> None:
+    st.subheader("6. Ask the dataset")
+    st.caption("Chat with Llama 3.3 70B about the tabular dataset created from the interview text.")
 
     if not st.session_state.messages:
         add_insight(
-            "Ask questions like: Which technology dominates this filtered portfolio? Which operators invest the most? "
-            "What does the relationship between capacity and generation suggest?"
+            "Ask questions like: Which themes appear most often? Which pain points have the highest urgency? Which respondent profiles seem most ready to adopt a solution?"
         )
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    user_prompt = st.chat_input("Ask something about the filtered renewable energy data...")
+    user_prompt = st.chat_input("Ask something about the structured interview data...")
     if not user_prompt:
         return
 
@@ -499,12 +601,12 @@ def render_chat(settings: dict, dataset_context: str) -> None:
         return
 
     with st.chat_message("assistant"):
-        with st.spinner("Analyzing filtered data..."):
+        with st.spinner("Interpreting structured interview data..."):
             try:
                 assistant_reply = request_groq_completion(
                     api_key=settings["api_key"],
-                    messages=build_messages(user_prompt, settings["language"], dataset_context),
-                    temperature=settings["temperature"],
+                    messages=build_analysis_messages(user_prompt, settings["language"], dataset_context),
+                    temperature=settings["analysis_temperature"],
                     max_tokens=settings["max_tokens"],
                 )
                 st.markdown(assistant_reply)
@@ -521,39 +623,53 @@ def render_chat(settings: dict, dataset_context: str) -> None:
     st.session_state.messages.append({"role": "assistant", "content": assistant_reply})
 
 
+def render_data_table(df: pd.DataFrame) -> None:
+    st.subheader("7. Structured table")
+    edited_df = st.data_editor(df, use_container_width=True, num_rows="dynamic")
+    st.download_button(
+        "Download structured CSV",
+        data=edited_df.to_csv(index=False).encode("utf-8"),
+        file_name="structured_interview_data.csv",
+        mime="text/csv",
+    )
+
+
 def main() -> None:
     initialize_session()
     render_header()
 
-    base_df = clean_data(load_data())
-    settings = build_sidebar(base_df)
-    dataset = clean_data(load_data(settings["uploaded_file"]))
-    filtered_df = filter_data(dataset, settings)
+    existing_df = normalize_records(st.session_state.structured_records) if st.session_state.structured_records else None
+    settings = build_sidebar(existing_df is not None and not existing_df.empty, existing_df)
 
+    structured_df = render_ingestion(settings)
+    if structured_df is None or structured_df.empty:
+        return
+
+    filtered_df = filter_structured_data(structured_df, settings["filters"])
     if filtered_df.empty:
-        st.warning("No records match the current filters.")
+        st.warning("No structured rows match the current filters.")
         return
 
     dataset_context = build_dataset_context(filtered_df)
 
-    tab_overview, tab_operations, tab_investment, tab_ai_summary, tab_chat, tab_data = st.tabs(
-        ["Overview", "Operations", "Investment", "AI Summary", "AI Chat", "Data"]
+    tab_overview, tab_needs, tab_scores, tab_summary, tab_chat, tab_data = st.tabs(
+        ["Overview", "Needs", "Scores", "AI Summary", "AI Chat", "Data"]
     )
 
     with tab_overview:
         render_overview(filtered_df)
 
-    with tab_operations:
-        render_operations(filtered_df)
+    with tab_needs:
+        render_needs_and_profiles(filtered_df)
 
-    with tab_investment:
-        render_investment(filtered_df)
+    with tab_scores:
+        render_scores(filtered_df)
 
-    with tab_ai_summary:
+    with tab_summary:
         render_ai_summary(settings, dataset_context)
 
     with tab_chat:
-        render_chat(settings, dataset_context)
+        render_ai_chat(settings, dataset_context)
 
     with tab_data:
         render_data_table(filtered_df)
