@@ -248,7 +248,7 @@ def render_numeric_eda(df: pd.DataFrame) -> None:
     )
     numeric_cols = numeric_columns(df)
     summary = df[numeric_cols].describe().T
-    summary["median"] = df[numeric_cols].median()
+    summary["median_value"] = df[numeric_cols].median()
     summary["variance"] = df[numeric_cols].var()
     summary["missing"] = df[numeric_cols].isna().sum()
     summary = summary.rename(
@@ -258,7 +258,7 @@ def render_numeric_eda(df: pd.DataFrame) -> None:
             "std": "std",
             "min": "min",
             "25%": "q1",
-            "50%": "median",
+            "50%": "median_from_describe",
             "75%": "q3",
             "max": "max",
         }
